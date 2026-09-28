@@ -1,0 +1,39 @@
+name: Neutral Relay Temporary Release Cleanup
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete relay prereleases older than 24 hours
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cutoff="$(date -u -d '24 hours ago' +%s)"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+          jq -sr '
+            .[] |
+            .[] |
+            select(.prerelease == true) |
+            select(.tag_name | startswith("relay-")) |
+            [.id, .tag_name, .created_at] |
+            @tsv
+          ' |
+          while IFS=$'\t' read -r id tag created; do
+            created_epoch="$(date -u -d "$created" +%s)"
+            if (( created_epoch < cutoff )); then
+              echo "Deleting expired relay release: $tag"
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" || true
+            fi
+          done

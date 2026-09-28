@@ -1,0 +1,265 @@
+name: Slim Nation Neutral APK Relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Approved private source project
+        required: true
+        type: choice
+        options:
+          - breakwave
+          - scratchless
+      source_sha:
+        description: Exact 40-character source commit SHA
+        required: true
+        type: string
+      flutter_version:
+        description: Exact Flutter SDK version pinned by the source project
+        required: true
+        default: "3.44.9"
+        type: string
+      delivery:
+        description: Delivery surface
+        required: true
+        default: public-release
+        type: choice
+        options:
+          - public-release
+          - actions-artifact
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neutral-apk-relay-${{ inputs.project }}-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build exact private source SHA
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Validate approved request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.source_sha }}" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo "source_sha must be exactly 40 hexadecimal characters"
+            exit 1
+          }
+          [[ "${{ inputs.flutter_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "flutter_version must look like X.Y.Z"
+            exit 1
+          }
+          case "${{ inputs.project }}" in
+            breakwave|scratchless) ;;
+            *) echo "unapproved project"; exit 1 ;;
+          esac
+
+      - name: Checkout BreakWave exact SHA
+        if: ${{ inputs.project == 'breakwave' }}
+        uses: actions/checkout@v7
+        with:
+          repository: lindsey-wells/breakwave
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.BREAKWAVE_DEPLOY_KEY }}
+          path: source
+          fetch-depth: 1
+          fetch-tags: false
+          submodules: false
+          persist-credentials: false
+          show-progress: false
+
+      - name: Checkout ScratchLess exact SHA
+        if: ${{ inputs.project == 'scratchless' }}
+        uses: actions/checkout@v7
+        with:
+          repository: cube23games/Scratchless
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.SCRATCHLESS_DEPLOY_KEY }}
+          path: source
+          fetch-depth: 1
+          fetch-tags: false
+          submodules: false
+          persist-credentials: false
+          show-progress: false
+
+      - name: Verify exact source identity
+        id: identity
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          requested="$(printf '%s' "${{ inputs.source_sha }}" | tr 'A-F' 'a-f')"
+          [[ "$actual" == "$requested" ]] || {
+            echo "HEAD mismatch"
+            exit 1
+          }
+          [[ -z "$(git status --porcelain)" ]] || {
+            echo "checkout is not clean"
+            exit 1
+          }
+          echo "commit=$actual" >> "$GITHUB_OUTPUT"
+          echo "short=${actual:0:12}" >> "$GITHUB_OUTPUT"
+          echo "Exact private source SHA verified."
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up exact Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          channel: stable
+          cache: true
+
+      - name: Verify Flutter SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(flutter --version --machine | jq -r '.frameworkVersion')"
+          [[ "$actual" == "${{ inputs.flutter_version }}" ]] || {
+            echo "Flutter SDK version mismatch"
+            exit 1
+          }
+          echo "Flutter SDK version verified."
+
+      - name: Resolve dependencies quietly
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          mkdir -p ../relay_private_logs
+          if ! flutter pub get > ../relay_private_logs/pubget.log 2>&1; then
+            echo "Dependency resolution failed. Diagnose in the private source CI."
+            exit 1
+          fi
+          echo "Dependencies resolved."
+
+      - name: Build temporary debug APK quietly
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          if ! flutter build apk --debug --no-pub > ../relay_private_logs/build.log 2>&1; then
+            echo "APK build failed. Diagnose in the private source CI."
+            exit 1
+          fi
+          test -f build/app/outputs/flutter-apk/app-debug.apk
+          echo "Temporary debug APK built."
+
+      - name: Stage APK and evidence only
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p relay_output
+          src="source/build/app/outputs/flutter-apk/app-debug.apk"
+          project="${{ inputs.project }}"
+          short="${{ steps.identity.outputs.short }}"
+          apk="relay_output/${project}-${short}-debug.apk"
+          cp "$src" "$apk"
+          apk_sha="$(sha256sum "$apk" | awk '{print $1}')"
+          apk_size="$(stat -c '%s' "$apk")"
+          {
+            echo "relay_owner=SlimNationworkz"
+            echo "relay_repository=SlimNationworkz/NeutralBuildRelay"
+            echo "project=$project"
+            echo "source_commit=${{ steps.identity.outputs.commit }}"
+            echo "flutter_version=${{ inputs.flutter_version }}"
+            echo "build_mode=debug"
+            echo "relay_run_id=${GITHUB_RUN_ID}"
+            echo "relay_run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "apk_file=$(basename "$apk")"
+            echo "apk_sha256=$apk_sha"
+            echo "apk_size_bytes=$apk_size"
+            echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > relay_output/RELAY_MANIFEST.txt
+          (
+            cd relay_output
+            sha256sum *.apk RELAY_MANIFEST.txt > SHA256SUMS.txt
+          )
+          echo "artifact_name=${project}-${short}-temporary-apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload one-day transfer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.stage.outputs.artifact_name }}
+          path: relay_output/**
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
+
+  publish_public_release:
+    name: Publish temporary public APK
+    if: ${{ inputs.delivery == 'public-release' }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download this run's transfer artifact
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ inputs.project }}-*-temporary-apk
+          path: release_payload
+          merge-multiple: true
+
+      - name: Verify transfer checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release_payload
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Publish temporary public prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(grep '^source_commit=' release_payload/RELAY_MANIFEST.txt | cut -d= -f2)"
+          short="${commit:0:12}"
+          tag="relay-${{ inputs.project }}-${short}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          title="${{ inputs.project }} temporary APK ${short}"
+          cat > release_notes.txt <<EOF
+          Temporary Slim Nation Works Neutral Build Relay output.
+
+          Project: ${{ inputs.project }}
+          Private source commit: ${commit}
+          Build mode: debug
+          Relay run: ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}
+
+          This is a temporary QA APK, not a production release.
+          The relay cleanup workflow removes relay prereleases after 24 hours.
+          Verify APK integrity with RELAY_MANIFEST.txt and SHA256SUMS.txt.
+          EOF
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "$title" \
+            --notes-file release_notes.txt \
+            release_payload/*
+
+      - name: Report public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 1
